@@ -1,0 +1,43 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "E:/Development/09_WiFi_CAMERA/build/CMakeFiles/bootloader"
+		},
+		{
+			"file" : "E:/Development/09_WiFi_CAMERA/build/CMakeFiles/bootloader.rule"
+		},
+		{
+			"file" : "E:/Development/09_WiFi_CAMERA/build/CMakeFiles/bootloader-complete.rule"
+		},
+		{
+			"file" : "E:/Development/09_WiFi_CAMERA/build/bootloader-prefix/src/bootloader-stamp/bootloader-build.rule"
+		},
+		{
+			"file" : "E:/Development/09_WiFi_CAMERA/build/bootloader-prefix/src/bootloader-stamp/bootloader-configure.rule"
+		},
+		{
+			"file" : "E:/Development/09_WiFi_CAMERA/build/bootloader-prefix/src/bootloader-stamp/bootloader-download.rule"
+		},
+		{
+			"file" : "E:/Development/09_WiFi_CAMERA/build/bootloader-prefix/src/bootloader-stamp/bootloader-install.rule"
+		},
+		{
+			"file" : "E:/Development/09_WiFi_CAMERA/build/bootloader-prefix/src/bootloader-stamp/bootloader-mkdir.rule"
+		},
+		{
+			"file" : "E:/Development/09_WiFi_CAMERA/build/bootloader-prefix/src/bootloader-stamp/bootloader-patch.rule"
+		},
+		{
+			"file" : "E:/Development/09_WiFi_CAMERA/build/bootloader-prefix/src/bootloader-stamp/bootloader-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"bootloader"
+		],
+		"name" : "bootloader"
+	}
+}
