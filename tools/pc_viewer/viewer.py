@@ -7,7 +7,7 @@ TCP 服务器端 Python 显示程序
 - 使用 OpenCV 实时解码与显示
 
 用法示例（Windows PowerShell）：
-    python ./tools/pc_viewer/viewer.py --host 0.0.0.0 --port 8080
+    python ./tools/pc_viewer/viewer.py --host 0.0.0.0 --port 8000
 
 按键：
   q  退出
