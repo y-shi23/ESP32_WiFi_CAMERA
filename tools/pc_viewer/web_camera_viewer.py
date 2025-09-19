@@ -22,7 +22,7 @@ from typing import Optional
 from queue import Queue, Empty
 import io
 
-from flask import Flask, render_template_string, Response
+from flask import Flask, render_template_string, Response, jsonify
 import cv2
 import numpy as np
 
@@ -33,6 +33,99 @@ EOI = b"\xff\xd9"  # JPEG End Of Image
 latest_frame = None
 frame_lock = threading.Lock()
 frame_queue = Queue(maxsize=10)  # 限制队列大小避免内存溢出
+
+# =============== 人脸检测 / 识别 ===============
+face_lock = threading.Lock()
+face_db = {}  # face_id -> {id, embedding, first_seen, last_seen, seen_count, thumb_jpeg}
+next_face_id = 1
+face_enabled = True
+face_cascade = None
+_face_frame_counter = 0
+
+def _init_face_detector():
+    global face_cascade, face_enabled
+    try:
+        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        if face_cascade.empty():
+            print('[WARN] 加载Haar人脸分类器失败，将禁用人脸功能')
+            face_enabled = False
+        else:
+            face_enabled = True
+            print('[INFO] 人脸检测已启用 (Haar Cascade)')
+    except Exception as e:
+        print(f'[WARN] 初始化人脸检测失败: {e}')
+        face_enabled = False
+
+def _compute_embedding(gray_roi: np.ndarray) -> Optional[np.ndarray]:
+    """简单的人脸特征向量：64x64灰度像素直方图均衡后展开并L2归一化。"""
+    try:
+        face_small = cv2.resize(gray_roi, (64, 64), interpolation=cv2.INTER_AREA)
+    except Exception:
+        return None
+    face_eq = cv2.equalizeHist(face_small)
+    vec = face_eq.astype(np.float32).reshape(-1)
+    vec -= vec.mean()
+    norm = np.linalg.norm(vec) + 1e-6
+    vec /= norm
+    return vec
+
+def _match_face(embedding: np.ndarray, threshold: float = 0.36) -> Optional[int]:
+    """在face_db中查找最相近的人脸，欧氏距离小于阈值则视为同一人。"""
+    with face_lock:
+        best_id = None
+        best_dist = 1e9
+        for fid, info in face_db.items():
+            emb = info.get('embedding')
+            if emb is None or emb.shape != embedding.shape:
+                continue
+            d = np.linalg.norm(emb - embedding)
+            if d < best_dist:
+                best_dist = d
+                best_id = fid
+        if best_dist <= threshold:
+            return best_id
+        return None
+
+def _make_thumbnail(bgr: np.ndarray, size: int = 112) -> Optional[bytes]:
+    try:
+        h, w = bgr.shape[:2]
+        side = min(h, w)
+        y0 = (h - side) // 2
+        x0 = (w - side) // 2
+        crop = bgr[y0:y0+side, x0:x0+side]
+        thumb = cv2.resize(crop, (size, size), interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode('.jpg', thumb, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        return buf.tobytes() if ok else None
+    except Exception:
+        return None
+
+def _update_face_db(face_img_bgr: np.ndarray, gray_roi: np.ndarray, embedding: np.ndarray) -> int:
+    """匹配或新增人脸，返回face_id。"""
+    global next_face_id
+    fid = _match_face(embedding)
+    now = time.time()
+    thumb = _make_thumbnail(face_img_bgr)
+    with face_lock:
+        if fid is None:
+            fid = next_face_id
+            next_face_id += 1
+            face_db[fid] = {
+                'id': fid,
+                'embedding': embedding.copy(),
+                'first_seen': now,
+                'last_seen': now,
+                'seen_count': 1,
+                'thumb_jpeg': thumb,
+            }
+        else:
+            info = face_db.get(fid)
+            if info is not None:
+                info['embedding'] = 0.8 * info['embedding'] + 0.2 * embedding
+                info['last_seen'] = now
+                info['seen_count'] += 1
+                if info['seen_count'] % 20 == 0 and thumb is not None:
+                    info['thumb_jpeg'] = thumb
+    return fid
 
 # HTML模板
 HTML_TEMPLATE = '''
@@ -316,6 +409,45 @@ HTML_TEMPLATE = '''
             const img = document.getElementById('camera-stream');
             img.addEventListener('dblclick', toggleFullscreen);
         };
+        // 人脸列表刷新函数
+        async function refreshFaces() {
+            try {
+                const res = await fetch('/faces?t=' + Date.now());
+                if (!res.ok) return;
+                const data = await res.json();
+                const list = document.getElementById('faces-grid');
+                const totalEl = document.getElementById('face-total');
+                if (!list) return;
+                list.innerHTML = '';
+                if (totalEl) totalEl.textContent = data.faces.length;
+                for (const f of data.faces) {
+                    const item = document.createElement('div');
+                    item.className = 'face-item';
+                    const img = document.createElement('img');
+                    img.className = 'face-thumb';
+                    img.alt = 'face ' + f.id;
+                    img.src = `/face_thumbnail/${f.id}.jpg?ts=${Math.floor(f.last_seen*1000)}`;
+                    const meta = document.createElement('div');
+                    meta.className = 'face-meta';
+                    const idSpan = document.createElement('span');
+                    idSpan.className = 'face-id';
+                    idSpan.textContent = `#${f.id}`;
+                    const statSpan = document.createElement('span');
+                    statSpan.className = 'face-stat';
+                    statSpan.title = `首次: ${new Date(f.first_seen*1000).toLocaleString()}\n最近: ${new Date(f.last_seen*1000).toLocaleString()}`;
+                    statSpan.textContent = `出现 ${f.seen_count}`;
+                    meta.appendChild(idSpan);
+                    meta.appendChild(statSpan);
+                    item.appendChild(img);
+                    item.appendChild(meta);
+                    list.appendChild(item);
+                }
+            } catch (e) {
+                // 忽略错误
+            }
+        }
+        // 页面加载后启动定时刷新
+        window.addEventListener('load', () => { try { refreshFaces(); } catch(e){} setInterval(refreshFaces, 2000); });
     </script>
 </head>
 <body>
@@ -344,6 +476,17 @@ HTML_TEMPLATE = '''
             <p>• ESP32需要配置正确的服务器IP和端口</p>
             <p>• 如果画面卡顿，请点击"刷新画面"按钮</p>
         </div>
+
+        <!-- 人脸列表卡片 -->
+        <div class="card faces-card">
+            <header>
+                <div style="font-weight:600">已识别人脸</div>
+                <div class="hint">共 <span id="face-total">0</span> 个</div>
+            </header>
+            <div id="faces-grid" class="faces-grid"></div>
+            <div class="hint" style="margin-top:8px">识别采用轻量特征，正面、充足光照效果更佳</div>
+        </div>
+
     </div>
 
     <!-- 全屏容器 -->
@@ -464,6 +607,16 @@ HTML_TEMPLATE_NEW = '''
         }
         .segmented .seg-btn.active { color: var(--text); background: #fff; }
         .hint { color: var(--muted); font-size: 12px; }
+
+        /* 人脸列表 */
+        .faces-card header { display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; }
+        .faces-grid { display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+        @media (min-width: 1200px) { .faces-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+        .face-item { border:1px solid var(--border); border-radius:10px; overflow:hidden; background:#fff; }
+        .face-thumb { width:100%; aspect-ratio:1 / 1; object-fit:cover; display:block; background:#111; }
+        .face-meta { padding:8px; display:flex; align-items:center; justify-content:space-between; font-size:12px; color:var(--muted);} 
+        .face-id { font-weight:600; color:var(--text); font-size:12px; }
+        .face-stat { font-variant-numeric: tabular-nums; }
     </style>
     <script>
         // 连接状态与尝试重连
@@ -678,16 +831,79 @@ def recv_images_from_connection(conn: socket.socket) -> None:
                     pass
 
 
+def _annotate_and_track(frame_bgr: np.ndarray) -> np.ndarray:
+    """对图像做人脸检测、识别与标注，返回标注后的BGR图。"""
+    global _face_frame_counter
+    h, w = frame_bgr.shape[:2]
+
+    if not face_enabled or face_cascade is None:
+        return frame_bgr
+
+    # 降频检测以降低CPU占用
+    _face_frame_counter = (_face_frame_counter + 1) % 3
+    do_detect = (_face_frame_counter == 0)
+
+    try:
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    except Exception:
+        return frame_bgr
+
+    faces_rects = []
+    if do_detect:
+        try:
+            scale = 0.6
+            small = cv2.resize(gray, (max(1, int(w*scale)), max(1, int(h*scale))), interpolation=cv2.INTER_AREA)
+            rects = face_cascade.detectMultiScale(small, scaleFactor=1.15, minNeighbors=5, minSize=(50, 50))
+            for (x, y, ww, hh) in rects:
+                X = int(x/scale); Y = int(y/scale); W = int(ww/scale); H = int(hh/scale)
+                pad = int(0.1 * max(W, H))
+                X0 = max(0, X - pad); Y0 = max(0, Y - pad)
+                X1 = min(w, X + W + pad); Y1 = min(h, Y + H + pad)
+                faces_rects.append((X0, Y0, X1 - X0, Y1 - Y0))
+        except Exception:
+            faces_rects = []
+
+    for (x, y, ww, hh) in faces_rects:
+        try:
+            roi_gray = gray[y:y+hh, x:x+ww]
+            roi_bgr = frame_bgr[y:y+hh, x:x+ww]
+            emb = _compute_embedding(roi_gray)
+            if emb is None:
+                continue
+            fid = _update_face_db(roi_bgr, roi_gray, emb)
+            cv2.rectangle(frame_bgr, (x, y), (x+ww, y+hh), (0, 200, 255), 2)
+            cv2.putText(frame_bgr, f"ID {fid}", (x, max(0, y-8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2, cv2.LINE_AA)
+        except Exception:
+            continue
+
+    return frame_bgr
+
 def generate_frames():
     """生成MJPEG流帧"""
+    # 初始化人脸检测器
+    if face_enabled and (face_cascade is None):
+        _init_face_detector()
     while True:
         try:
             # 从队列获取最新帧
             frame_data = frame_queue.get(timeout=1.0)
-            
+            # 解码、标注后再编码
+            npbuf = np.frombuffer(frame_data, dtype=np.uint8)
+            frame = cv2.imdecode(npbuf, cv2.IMREAD_COLOR)
+            if frame is None:
+                out_bytes = frame_data
+            else:
+                # 人脸检测与标注
+                try:
+                    out_img = _annotate_and_track(frame)
+                except NameError:
+                    # 尚未定义标注函数（安全兜底）
+                    out_img = frame
+                ok, enc = cv2.imencode('.jpg', out_img, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                out_bytes = enc.tobytes() if ok else frame_data
             # 构造MJPEG边界
             yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_data + b'\r\n')
+                   b'Content-Type: image/jpeg\r\n\r\n' + out_bytes + b'\r\n')
                    
         except Empty:
             # 队列为空时发送空白帧
@@ -718,6 +934,37 @@ def video_feed():
     return Response(generate_frames(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
+@app.route('/faces')
+def faces():
+    """返回已识别人脸列表。"""
+    with face_lock:
+        faces_list = [
+            {
+                'id': info['id'],
+                'first_seen': info['first_seen'],
+                'last_seen': info['last_seen'],
+                'seen_count': info['seen_count'],
+            }
+            for info in face_db.values()
+        ]
+    faces_list.sort(key=lambda x: x['last_seen'], reverse=True)
+    return jsonify({'faces': faces_list})
+
+@app.route('/face_thumbnail/<int:face_id>.jpg')
+def face_thumbnail(face_id: int):
+    with face_lock:
+        info = face_db.get(face_id)
+        data = info.get('thumb_jpeg') if info else None
+    if not data:
+        # 返回简单占位图
+        img = np.zeros((112, 112, 3), dtype=np.uint8)
+        cv2.putText(img, 'N/A', (28, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2, cv2.LINE_AA)
+        ok, buf = cv2.imencode('.jpg', img)
+        data = buf.tobytes() if ok else b''
+    resp = Response(data, mimetype='image/jpeg')
+    resp.headers['Cache-Control'] = 'no-store, max-age=0'
+    return resp
+
 def main() -> int:
     args = parse_args()
     
@@ -744,6 +991,7 @@ def main() -> int:
     
     try:
         # 启动Flask Web服务器
+        _init_face_detector()
         app.run(host='0.0.0.0', port=args.web_port, debug=False, threaded=True)
     except KeyboardInterrupt:
         print("\n[INFO] 程序已退出")

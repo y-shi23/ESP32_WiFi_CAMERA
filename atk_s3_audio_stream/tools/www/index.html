@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>ESP32S3 Audio Bridge</title>
+  <style>
+    body { font-family: sans-serif; margin: 2rem; }
+    button { margin-right: 1rem; }
+    .row { margin: 0.5rem 0; }
+    .status { margin-top: 1rem; color: #333; }
+  </style>
+</head>
+<body>
+  <h2>ESP32S3 ATK-DNESP32S3 Audio Bridge</h2>
+  <div class="row">
+    <button id="connectBtn">Connect WS</button>
+    <button id="micBtn" disabled>Start Mic</button>
+  </div>
+  <div class="row">
+    <label>WS URL: <input id="wsUrl" size="40" /></label>
+  </div>
+  <div class="status" id="status"></div>
+
+  <script>
+    const statusEl = document.getElementById('status');
+    const wsUrlEl = document.getElementById('wsUrl');
+    const connectBtn = document.getElementById('connectBtn');
+    const micBtn = document.getElementById('micBtn');
+
+    const defaultWs = `ws://${location.hostname || 'localhost'}:9001`;
+    wsUrlEl.value = defaultWs;
+
+    let ws = null;
+    let audioCtx = null;
+    let playbackNode = null;
+    let captureNode = null;
+    let inputStream = null;
+    let playbackQueue = new Int16Array(0);
+    let capturing = false;
+
+    function log(msg) { statusEl.textContent = msg; }
+
+    function appendToQueue(newBuf) {
+      // concat Int16Array efficiently
+      const out = new Int16Array(playbackQueue.length + newBuf.length);
+      out.set(playbackQueue, 0);
+      out.set(newBuf, playbackQueue.length);
+      playbackQueue = out;
+    }
+
+    function takeFromQueue(count) {
+      const n = Math.min(count, playbackQueue.length);
+      const part = playbackQueue.slice(0, n);
+      playbackQueue = playbackQueue.slice(n);
+      return part;
+    }
+
+    function ensureAudio() {
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      }
+    }
+
+    function startPlayback() {
+      ensureAudio();
+      const bufferSize = 2048;
+      playbackNode = audioCtx.createScriptProcessor(bufferSize, 0, 1);
+      playbackNode.onaudioprocess = (e) => {
+        const out = e.outputBuffer.getChannelData(0);
+        // We have PCM at 24000 Hz mono; AudioContext typically 48000 Hz.
+        // Naive upsample by duplication.
+        const need = out.length / 2; // number of 24k samples needed
+        const src = takeFromQueue(need);
+        if (src.length < need) {
+          // underrun: fill zeros
+          const tmp = new Int16Array(need);
+          tmp.set(src);
+          for (let i = 0, j = 0; i < tmp.length; ++i) {
+            const s = tmp[i] / 32768;
+            out[j++] = s;
+            out[j++] = s;
+          }
+        } else {
+          for (let i = 0, j = 0; i < src.length; ++i) {
+            const s = src[i] / 32768;
+            out[j++] = s;
+            out[j++] = s;
+          }
+        }
+      };
+      playbackNode.connect(audioCtx.destination);
+    }
+
+    function stopPlayback() {
+      if (playbackNode) {
+        playbackNode.disconnect();
+        playbackNode = null;
+      }
+    }
+
+    async function startMic() {
+      ensureAudio();
+      inputStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const source = audioCtx.createMediaStreamSource(inputStream);
+      const bufferSize = 1024;
+      captureNode = audioCtx.createScriptProcessor(bufferSize, 1, 0);
+      let decimatorBuf = [];
+      captureNode.onaudioprocess = (e) => {
+        if (!capturing || !ws || ws.readyState !== WebSocket.OPEN) return;
+        const input = e.inputBuffer.getChannelData(0); // Float32 at ctx rate (e.g., 48k)
+        // Decimate by 2 (48k -> 24k)
+        const decimated = new Int16Array(Math.floor(input.length / 2));
+        let di = 0;
+        for (let i = 0; i + 1 < input.length; i += 2) {
+          let s = input[i];
+          if (s > 1) s = 1; else if (s < -1) s = -1;
+          decimated[di++] = s * 32767;
+        }
+        // Chunk into ~20ms @24k = 480 samples -> 960 bytes
+        decimatorBuf.push(decimated);
+        // Flatten length
+        let total = 0;
+        for (const b of decimatorBuf) total += b.length;
+        if (total >= 480) {
+          const out = new Int16Array(480);
+          let off = 0;
+          while (off < 480 && decimatorBuf.length) {
+            const head = decimatorBuf[0];
+            const need = Math.min(head.length, 480 - off);
+            out.set(head.subarray(0, need), off);
+            off += need;
+            if (need < head.length) {
+              decimatorBuf[0] = head.subarray(need);
+            } else {
+              decimatorBuf.shift();
+            }
+          }
+          ws.send(out.buffer);
+        }
+      };
+      source.connect(captureNode);
+      captureNode.connect(audioCtx.destination); // keep graph alive
+      capturing = true;
+      micBtn.textContent = 'Stop Mic';
+    }
+
+    function stopMic() {
+      capturing = false;
+      if (captureNode) { captureNode.disconnect(); captureNode = null; }
+      if (inputStream) { inputStream.getTracks().forEach(t => t.stop()); inputStream = null; }
+      micBtn.textContent = 'Start Mic';
+    }
+
+    connectBtn.onclick = () => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.close();
+        return;
+      }
+      const url = wsUrlEl.value || defaultWs;
+      ws = new WebSocket(url);
+      ws.binaryType = 'arraybuffer';
+      ws.onopen = () => { log('WS connected'); startPlayback(); micBtn.disabled = false; connectBtn.textContent = 'Disconnect'; };
+      ws.onclose = () => { log('WS closed'); micBtn.disabled = true; stopMic(); stopPlayback(); connectBtn.textContent = 'Connect WS'; };
+      ws.onerror = (e) => { log('WS error'); };
+      ws.onmessage = (ev) => {
+        const buf = new Int16Array(ev.data);
+        appendToQueue(buf);
+      };
+    };
+
+    micBtn.onclick = () => {
+      if (!capturing) startMic(); else stopMic();
+    };
+  </script>
+</body>
+</html>
+

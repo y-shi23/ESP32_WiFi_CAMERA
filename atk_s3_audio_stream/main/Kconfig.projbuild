@@ -1,0 +1,24 @@
+menu "atk_s3_audio_stream"
+
+config WIFI_SSID
+    string "WiFi SSID"
+    default "YOUR_SSID"
+    help
+        SSID for WiFi station mode.
+
+config WIFI_PASSWORD
+    string "WiFi Password"
+    default "YOUR_PASSWORD"
+    help
+        Password for WiFi station mode.
+
+config STREAM_SERVER_HOST
+    string "Stream server host (PC IP)"
+    default "192.168.1.2"
+
+config STREAM_SERVER_PORT
+    int "Stream server TCP port"
+    default 9002
+
+endmenu
+
