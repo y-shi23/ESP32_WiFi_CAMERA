@@ -1,0 +1,12 @@
+# ESP32 WiFi摄像头Web显示程序依赖文件
+
+# 必需依赖（简化版本）
+flask>=2.0.0
+
+# 可选依赖（完整版本）
+# opencv-python>=4.5.0
+# numpy>=1.20.0
+
+# 说明：
+# - 简化版本 (web_camera_viewer_simple.py) 只需要 Flask
+# - 完整版本 (web_camera_viewer.py) 需要 Flask + OpenCV + NumPy
